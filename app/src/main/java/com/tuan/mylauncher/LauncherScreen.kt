@@ -9,6 +9,7 @@ import android.provider.AlarmClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -18,7 +19,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,6 +61,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -70,12 +73,15 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,6 +97,9 @@ import kotlinx.coroutines.launch
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
 
 // Chữ trắng có bóng mờ để đọc rõ trên mọi hình nền
 private val shadow = Shadow(Color.Black.copy(alpha = 0.55f), Offset(0f, 2f), 8f)
@@ -111,6 +120,7 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
     var drawerOpen by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     var pendingLetter by remember { mutableStateOf<String?>(null) }
+    var homeBarDragging by remember { mutableStateOf(false) }
 
     val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -166,14 +176,9 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
             modifier = Modifier.graphicsLayer { alpha = homeAlpha },
             repo = repo,
             favorites = favorites,
-            letters = allLetters,
             onOpen = ::open,
             onToggleFavorite = ::toggleFavorite,
             onOpenDrawer = { drawerOpen = true },
-            onLetter = { letter ->
-                pendingLetter = letter
-                drawerOpen = true
-            },
         )
 
         AnimatedVisibility(
@@ -192,7 +197,30 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
                 onOpen = ::open,
                 onToggleFavorite = ::toggleFavorite,
                 onClose = ::closeDrawer,
+                showAlphabet = !homeBarDragging,
             )
+        }
+
+        // Thanh chữ cái của màn hình chính, nằm trên cùng để hiệu ứng sóng
+        // vẫn thấy được khi ngăn danh sách trượt lên trong lúc đang vuốt
+        if (!drawerOpen || homeBarDragging) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .systemBarsPadding()
+            ) {
+                AlphabetBar(
+                    letters = allLetters,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 4.dp),
+                    onDragStateChange = { homeBarDragging = it },
+                    onSelect = { letter ->
+                        pendingLetter = letter
+                        drawerOpen = true
+                    },
+                )
+            }
         }
     }
 }
@@ -206,11 +234,9 @@ private fun HomeScreen(
     modifier: Modifier = Modifier,
     repo: AppRepository,
     favorites: List<AppInfo>,
-    letters: List<String>,
     onOpen: (AppInfo) -> Unit,
     onToggleFavorite: (AppInfo) -> Unit,
     onOpenDrawer: () -> Unit,
-    onLetter: (String) -> Unit,
 ) {
     val threshold = with(LocalDensity.current) { 56.dp.toPx() }
     val openDrawer by rememberUpdatedState(onOpenDrawer)
@@ -285,15 +311,6 @@ private fun HomeScreen(
             }
             Spacer(Modifier.height(32.dp))
         }
-
-        // Thanh chữ cái trên màn hình chính: chạm/vuốt sẽ mở danh sách tại chữ đó
-        AlphabetBar(
-            letters = letters,
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 4.dp),
-            onSelect = onLetter,
-        )
     }
 }
 
@@ -313,8 +330,10 @@ private fun AppDrawer(
     onOpen: (AppInfo) -> Unit,
     onToggleFavorite: (AppInfo) -> Unit,
     onClose: () -> Unit,
+    showAlphabet: Boolean,
 ) {
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val closeDistance = with(density) { 110.dp.toPx() }
     val close by rememberUpdatedState(onClose)
@@ -404,7 +423,11 @@ private fun AppDrawer(
         Column(Modifier.fillMaxSize()) {
             SearchBar(
                 query = query,
-                onQueryChange = onQueryChange,
+                onQueryChange = {
+                    onQueryChange(it)
+                    // Gõ hoặc xoá chữ: luôn đưa danh sách về đầu
+                    scope.launch { listState.scrollToItem(0) }
+                },
                 onGo = { filtered.firstOrNull()?.let(onOpen) },
             )
             Box(Modifier.weight(1f)) {
@@ -448,18 +471,19 @@ private fun AppDrawer(
                         }
                     }
                 }
-
-                val scope = rememberCoroutineScope()
-                AlphabetBar(
-                    letters = letterIndex.keys.toList(),
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .padding(end = 4.dp),
-                    onSelect = { letter ->
-                        letterIndex[letter]?.let { idx -> scope.launch { listState.scrollToItem(idx) } }
-                    },
-                )
             }
+        }
+
+        if (showAlphabet) {
+            AlphabetBar(
+                letters = letterIndex.keys.toList(),
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 4.dp),
+                onSelect = { letter ->
+                    letterIndex[letter]?.let { idx -> scope.launch { listState.scrollToItem(idx) } }
+                },
+            )
         }
     }
 }
@@ -617,25 +641,57 @@ private fun AppRow(
 }
 
 // ===========================================================================
-// Thanh chữ cái A–Z bên phải: chạm hoặc vuốt để nhảy nhanh
+// Thanh chữ cái A–Z với hiệu ứng sóng kiểu Niagara:
+// các chữ gần ngón tay phình to và cong ra trái, kèm bong bóng chữ lớn.
 // ===========================================================================
 @Composable
 private fun AlphabetBar(
     letters: List<String>,
     modifier: Modifier = Modifier,
+    onDragStateChange: (Boolean) -> Unit = {},
     onSelect: (String) -> Unit,
 ) {
-    var heightPx by remember { mutableIntStateOf(1) }
-    var active by remember { mutableStateOf<String?>(null) }
+    val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
+    val textMeasurer = rememberTextMeasurer()
     val currentOnSelect by rememberUpdatedState(onSelect)
-    val currentLetters by rememberUpdatedState(letters)
+    val currentOnDrag by rememberUpdatedState(onDragStateChange)
+
+    var touching by remember { mutableStateOf(false) }
+    var touchY by remember { mutableFloatStateOf(0f) }
+    var active by remember { mutableStateOf<String?>(null) }
+    val centers = remember(letters) { FloatArray(letters.size) }
+
+    // Độ mạnh của sóng: 0 = phẳng, 1 = phình hết cỡ
+    val strength by animateFloatAsState(
+        targetValue = if (touching) 1f else 0f,
+        animationSpec = tween(durationMillis = if (touching) 120 else 320),
+        label = "wave",
+    )
+
+    val waveRadius = with(density) { 100.dp.toPx() }   // bán kính vùng phình
+    val maxShift = with(density) { 46.dp.toPx() }      // chữ cong ra trái tối đa
+    val bubbleRadius = with(density) { 34.dp.toPx() }
+    val bubbleOffset = with(density) { 104.dp.toPx() } // khoảng cách bong bóng tới thanh
+    val bubbleText = remember { TextStyle(fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color(0xFF15181C)) }
+
+    fun waveAt(index: Int): Float {
+        val c = centers.getOrElse(index) { return 0f }
+        val d = abs(c - touchY)
+        if (d >= waveRadius) return 0f
+        return cos(d / waveRadius * (PI / 2)).toFloat() * strength
+    }
 
     fun pick(y: Float) {
-        val list = currentLetters
-        if (list.isEmpty()) return
-        val i = ((y / heightPx) * list.size).toInt().coerceIn(0, list.lastIndex)
-        val letter = list[i]
+        touchY = y
+        if (letters.isEmpty()) return
+        var best = 0
+        var bestDistance = Float.MAX_VALUE
+        centers.forEachIndexed { i, c ->
+            val d = abs(c - y)
+            if (d < bestDistance) { bestDistance = d; best = i }
+        }
+        val letter = letters[best.coerceIn(0, letters.lastIndex)]
         if (letter != active) {
             active = letter
             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -647,32 +703,72 @@ private fun AlphabetBar(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = modifier
-            .width(24.dp)
-            .onSizeChanged { heightPx = it.height.coerceAtLeast(1) }
-            .pointerInput(Unit) {
-                detectVerticalDragGestures(
-                    onDragStart = { pick(it.y) },
-                    onDragEnd = { active = null },
-                    onDragCancel = { active = null },
-                ) { change, _ ->
-                    change.consume()
-                    pick(change.position.y)
+            .width(28.dp)
+            .pointerInput(letters) {
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    down.consume()
+                    active = null
+                    touching = true
+                    currentOnDrag(true)
+                    try {
+                        pick(down.position.y)
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) break
+                            change.consume()
+                            pick(change.position.y)
+                        }
+                    } finally {
+                        touching = false
+                        currentOnDrag(false)
+                    }
                 }
             }
-            .pointerInput(Unit) {
-                detectTapGestures { pick(it.y); active = null }
+            .drawWithContent {
+                drawContent()
+                val letter = active ?: return@drawWithContent
+                if (strength < 0.01f) return@drawWithContent
+                val center = Offset(size.width / 2f - bubbleOffset, touchY)
+                drawCircle(
+                    color = Color.White.copy(alpha = 0.95f * strength),
+                    radius = bubbleRadius * (0.5f + 0.5f * strength),
+                    center = center,
+                )
+                val layout = textMeasurer.measure(letter, bubbleText)
+                drawText(
+                    textLayoutResult = layout,
+                    topLeft = Offset(
+                        center.x - layout.size.width / 2f,
+                        center.y - layout.size.height / 2f,
+                    ),
+                    alpha = strength,
+                )
             },
     ) {
-        letters.forEach { letter ->
-            val isActive = letter == active
+        letters.forEachIndexed { index, letter ->
+            val isActive = touching && letter == active
             Text(
                 text = letter,
                 style = textOnWallpaper.copy(
-                    fontSize = if (isActive) 16.sp else 11.sp,
+                    fontSize = 11.sp,
                     fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.7f),
+                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.75f),
                 ),
-                modifier = Modifier.padding(vertical = 1.5.dp),
+                modifier = Modifier
+                    .onGloballyPositioned {
+                        if (index < centers.size) {
+                            centers[index] = it.positionInParent().y + it.size.height / 2f
+                        }
+                    }
+                    .graphicsLayer {
+                        val w = waveAt(index)
+                        translationX = -w * maxShift
+                        scaleX = 1f + w * 0.9f
+                        scaleY = 1f + w * 0.9f
+                    }
+                    .padding(vertical = 1.5.dp),
             )
         }
     }

@@ -8,6 +8,7 @@ import android.os.BatteryManager
 import android.provider.AlarmClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -157,8 +158,12 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
         repo.saveFavorites(favoriteKeys)
     }
 
+    // Màn hình chính mờ dần khi mở danh sách, để không bị chữ chồng lên nhau
+    val homeAlpha by animateFloatAsState(if (drawerOpen) 0f else 1f, label = "homeAlpha")
+
     Box(Modifier.fillMaxSize()) {
         HomeScreen(
+            modifier = Modifier.graphicsLayer { alpha = homeAlpha },
             repo = repo,
             favorites = favorites,
             letters = allLetters,
@@ -198,6 +203,7 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
 // ===========================================================================
 @Composable
 private fun HomeScreen(
+    modifier: Modifier = Modifier,
     repo: AppRepository,
     favorites: List<AppInfo>,
     letters: List<String>,
@@ -211,7 +217,7 @@ private fun HomeScreen(
     var dragTotal by remember { mutableFloatStateOf(0f) }
 
     Box(
-        Modifier
+        modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
@@ -387,7 +393,7 @@ private fun AppDrawer(
         Modifier
             .fillMaxSize()
             .graphicsLayer { translationY = pull * 0.5f }
-            .background(Color.Black.copy(alpha = 0.62f))
+            .background(Color.Black.copy(alpha = 0.72f))
             // Chặn chạm xuyên xuống màn hình chính phía dưới
             .pointerInput(Unit) {
                 awaitPointerEventScope { while (true) awaitPointerEvent() }

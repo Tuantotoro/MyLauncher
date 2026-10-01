@@ -12,8 +12,18 @@ android {
         applicationId = "com.tuan.mylauncher"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
+    }
+
+    // Chữ ký cố định: các bản sau cài đè được, không cần gỡ app
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("mylauncher.keystore")
+            storePassword = "android"
+            keyAlias = "mylauncher"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {

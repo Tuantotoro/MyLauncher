@@ -3,6 +3,8 @@
 
     <!-- Cho phép mở màn hình "Gỡ cài đặt" của ứng dụng khác -->
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <!-- Cho phép vuốt xuống ở màn hình chính để mở thanh thông báo -->
+    <uses-permission android:name="android.permission.EXPAND_STATUS_BAR" />
 
     <!-- Android 11+: khai báo để được nhìn thấy danh sách ứng dụng có biểu tượng -->
     <queries>

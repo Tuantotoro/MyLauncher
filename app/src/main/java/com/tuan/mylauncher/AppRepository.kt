@@ -103,6 +103,18 @@ class AppRepository(private val context: Context) {
         }
     }
 
+    fun toast(message: String) {
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    }
+
+    /** Kéo thanh thông báo xuống (khi vuốt xuống ở màn hình chính). */
+    fun expandNotifications() {
+        try {
+            val statusBar = context.getSystemService("statusbar") ?: return
+            statusBar.javaClass.getMethod("expandNotificationsPanel").invoke(statusBar)
+        } catch (_: Exception) { }
+    }
+
     /** Mở một màn hình hệ thống (đồng hồ báo thức, lịch...), bỏ qua nếu máy không có. */
     fun openSafely(intent: Intent) {
         try {

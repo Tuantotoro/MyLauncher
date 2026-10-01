@@ -7,6 +7,11 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.provider.AlarmClock
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -17,10 +22,12 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,16 +63,22 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -81,67 +95,236 @@ import java.util.Locale
 private val shadow = Shadow(Color.Black.copy(alpha = 0.55f), Offset(0f, 2f), 8f)
 private val textOnWallpaper = TextStyle(color = Color.White, shadow = shadow)
 
-/** Một dòng trong danh sách: tiêu đề chữ cái hoặc một ứng dụng. */
-private sealed class ListRow(val key: String) {
-    class Header(val letter: String) : ListRow("h_$letter")
-    class App(val app: AppInfo, val isFavorite: Boolean, section: String) :
-        ListRow("${section}_${app.key}")
-}
+private const val MAX_FAVORITES = 7
 
-private const val FAVORITE_MARK = "★"
-private const val TOP_ITEMS = 2 // đồng hồ + ô tìm kiếm nằm trước danh sách
+/** Sắp xếp chữ cái: A–Z trước, "#" (số, ký hiệu) sau cùng. */
+private val letterOrder = compareBy<String> { it == "#" }.thenBy { it }
 
+// ===========================================================================
+// Khung chính: màn hình chính + ngăn "Tất cả ứng dụng" trượt lên
+// ===========================================================================
 @Composable
 fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
     var apps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var favoriteKeys by remember { mutableStateOf(repo.favorites()) }
+    var drawerOpen by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
+    var pendingLetter by remember { mutableStateOf<String?>(null) }
 
-    val listState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Tải lại danh sách mỗi khi quay về màn hình chính (bắt được app mới cài / vừa gỡ)
+    // Tải lại danh sách mỗi khi quay về màn hình chính
     LaunchedEffect(Unit) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             apps = repo.loadApps()
         }
     }
 
-    fun resetView() {
+    fun closeDrawer() {
+        drawerOpen = false
         query = ""
         focusManager.clearFocus()
     }
 
-    // Bấm Home khi đang ở launcher: xoá tìm kiếm, cuộn lên đầu
-    LaunchedEffect(homeSignal) {
-        if (homeSignal > 0) {
-            resetView()
-            listState.animateScrollToItem(0)
-        }
-    }
-    BackHandler(enabled = query.isNotEmpty()) { resetView() }
+    // Bấm Home hoặc Back: đóng danh sách, quay về màn hình chính
+    LaunchedEffect(homeSignal) { if (homeSignal > 0) closeDrawer() }
+    BackHandler(enabled = drawerOpen) { closeDrawer() }
 
-    // ----- Dữ liệu cho danh sách -----
     val favorites = remember(apps, favoriteKeys) {
         favoriteKeys.mapNotNull { k -> apps.find { it.key == k } }
     }
+    val allLetters = remember(apps) {
+        apps.map { it.letter }.distinct().sortedWith(letterOrder)
+    }
+
+    fun open(app: AppInfo) {
+        repo.launch(app)
+        closeDrawer()
+    }
+
+    fun toggleFavorite(app: AppInfo) {
+        if (app.key in favoriteKeys) {
+            favoriteKeys = favoriteKeys - app.key
+        } else {
+            if (favoriteKeys.size >= MAX_FAVORITES) {
+                repo.toast("Tối đa $MAX_FAVORITES ứng dụng yêu thích. Hãy bỏ bớt một ứng dụng trước.")
+                return
+            }
+            favoriteKeys = favoriteKeys + app.key
+            repo.toast("Đã thêm ${app.label} vào màn hình chính")
+        }
+        repo.saveFavorites(favoriteKeys)
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        HomeScreen(
+            repo = repo,
+            favorites = favorites,
+            letters = allLetters,
+            onOpen = ::open,
+            onToggleFavorite = ::toggleFavorite,
+            onOpenDrawer = { drawerOpen = true },
+            onLetter = { letter ->
+                pendingLetter = letter
+                drawerOpen = true
+            },
+        )
+
+        AnimatedVisibility(
+            visible = drawerOpen,
+            enter = slideInVertically { it / 4 } + fadeIn(),
+            exit = slideOutVertically { it / 4 } + fadeOut(),
+        ) {
+            AppDrawer(
+                repo = repo,
+                apps = apps,
+                favoriteKeys = favoriteKeys,
+                query = query,
+                onQueryChange = { query = it },
+                pendingLetter = pendingLetter,
+                onLetterHandled = { pendingLetter = null },
+                onOpen = ::open,
+                onToggleFavorite = ::toggleFavorite,
+                onClose = ::closeDrawer,
+            )
+        }
+    }
+}
+
+// ===========================================================================
+// Màn hình chính: đồng hồ + vài ứng dụng yêu thích, nhìn thấy hình nền
+// Vuốt lên: mở danh sách. Vuốt xuống: mở thanh thông báo.
+// ===========================================================================
+@Composable
+private fun HomeScreen(
+    repo: AppRepository,
+    favorites: List<AppInfo>,
+    letters: List<String>,
+    onOpen: (AppInfo) -> Unit,
+    onToggleFavorite: (AppInfo) -> Unit,
+    onOpenDrawer: () -> Unit,
+    onLetter: (String) -> Unit,
+) {
+    val threshold = with(LocalDensity.current) { 56.dp.toPx() }
+    val openDrawer by rememberUpdatedState(onOpenDrawer)
+    var dragTotal by remember { mutableFloatStateOf(0f) }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0x40000000), Color.Transparent, Color(0x40000000))
+                )
+            )
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
+                    onDragStart = { dragTotal = 0f },
+                    onDragEnd = {
+                        when {
+                            dragTotal < -threshold -> openDrawer()
+                            dragTotal > threshold -> repo.expandNotifications()
+                        }
+                        dragTotal = 0f
+                    },
+                    onDragCancel = { dragTotal = 0f },
+                ) { change, amount ->
+                    change.consume()
+                    dragTotal += amount
+                }
+            }
+            .systemBarsPadding()
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(end = 32.dp)
+        ) {
+            ClockHeader(repo)
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                if (favorites.isEmpty()) {
+                    Column(Modifier.padding(horizontal = 24.dp)) {
+                        Text(
+                            "Vuốt lên để xem tất cả ứng dụng",
+                            style = textOnWallpaper.copy(fontSize = 18.sp),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Nhấn giữ một ứng dụng và chọn \"Thêm vào yêu thích\" để ghim nó ra đây.",
+                            style = textOnWallpaper.copy(fontSize = 14.sp, color = Color.White.copy(alpha = 0.75f)),
+                        )
+                    }
+                } else {
+                    Column {
+                        favorites.forEach { app ->
+                            AppRow(
+                                app = app,
+                                isFavorite = true,
+                                large = true,
+                                onOpen = { onOpen(app) },
+                                onToggleFavorite = { onToggleFavorite(app) },
+                                onInfo = { repo.openAppInfo(app) },
+                                onUninstall = { repo.uninstall(app) },
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(32.dp))
+        }
+
+        // Thanh chữ cái trên màn hình chính: chạm/vuốt sẽ mở danh sách tại chữ đó
+        AlphabetBar(
+            letters = letters,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 4.dp),
+            onSelect = onLetter,
+        )
+    }
+}
+
+// ===========================================================================
+// Ngăn "Tất cả ứng dụng": tìm kiếm + danh sách A–Z
+// Kéo xuống khi đang ở đầu danh sách để đóng.
+// ===========================================================================
+@Composable
+private fun AppDrawer(
+    repo: AppRepository,
+    apps: List<AppInfo>,
+    favoriteKeys: List<String>,
+    query: String,
+    onQueryChange: (String) -> Unit,
+    pendingLetter: String?,
+    onLetterHandled: () -> Unit,
+    onOpen: (AppInfo) -> Unit,
+    onToggleFavorite: (AppInfo) -> Unit,
+    onClose: () -> Unit,
+) {
+    val listState = rememberLazyListState()
+    val density = LocalDensity.current
+    val closeDistance = with(density) { 110.dp.toPx() }
+    val close by rememberUpdatedState(onClose)
+    var pull by remember { mutableFloatStateOf(0f) }
+
     val filtered = remember(apps, query) {
         val q = query.trim().simplify()
         if (q.isEmpty()) apps else apps.filter { it.searchName.contains(q) }
     }
-    val rows = remember(filtered, favorites, query) {
+    val rows = remember(filtered, favoriteKeys) {
         buildList {
-            if (query.isBlank() && favorites.isNotEmpty()) {
-                add(ListRow.Header(FAVORITE_MARK))
-                favorites.forEach { add(ListRow.App(it, true, "fav")) }
-            }
             filtered.groupBy { it.letter }
-                .toSortedMap(compareBy<String> { it == "#" }.thenBy { it })
+                .toSortedMap(letterOrder)
                 .forEach { (letter, list) ->
                     add(ListRow.Header(letter))
-                    list.forEach { add(ListRow.App(it, it.key in favoriteKeys, "all")) }
+                    list.forEach { add(ListRow.App(it, it.key in favoriteKeys)) }
                 }
         }
     }
@@ -151,94 +334,145 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
             .associate { (it.value as ListRow.Header).letter to it.index }
     }
 
-    fun open(app: AppInfo) {
-        repo.launch(app)
-        resetView()
+    // Mở từ thanh chữ cái ở màn hình chính: nhảy tới chữ đó
+    LaunchedEffect(pendingLetter, letterIndex) {
+        val letter = pendingLetter ?: return@LaunchedEffect
+        letterIndex[letter]?.let { listState.scrollToItem(it) }
+        onLetterHandled()
     }
 
-    fun toggleFavorite(app: AppInfo) {
-        favoriteKeys = if (app.key in favoriteKeys) favoriteKeys - app.key else favoriteKeys + app.key
-        repo.saveFavorites(favoriteKeys)
+    // Kéo xuống ở đầu danh sách để đóng
+    val pullToClose = remember {
+        object : NestedScrollConnection {
+            var startedAtTop = false
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
+                if (available.y > 0f) {
+                    pull += available.y
+                    if (pull > closeDistance) {
+                        pull = 0f
+                        close()
+                    }
+                    return Offset(0f, available.y)
+                }
+                if (available.y < 0f || consumed.y < 0f) pull = 0f
+                return Offset.Zero
+            }
+
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                // Đang kéo xuống rồi đổi ý kéo lên: trả lại vị trí trước
+                if (pull > 0f && available.y < 0f) {
+                    val used = maxOf(available.y, -pull)
+                    pull += used
+                    return Offset(0f, used)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                startedAtTop = !listState.canScrollBackward
+                pull = 0f
+                return Velocity.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                if (startedAtTop && available.y > 2500f) close()
+                return Velocity.Zero
+            }
+        }
     }
 
     Box(
         Modifier
             .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(Color(0x22000000), Color(0x88000000))))
+            .graphicsLayer { translationY = pull * 0.5f }
+            .background(Color.Black.copy(alpha = 0.62f))
+            // Chặn chạm xuyên xuống màn hình chính phía dưới
+            .pointerInput(Unit) {
+                awaitPointerEventScope { while (true) awaitPointerEvent() }
+            }
             .systemBarsPadding()
             .imePadding()
     ) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(end = 32.dp),
-        ) {
-            item(key = "clock") { ClockHeader(repo) }
-            item(key = "search") {
-                SearchBar(
-                    query = query,
-                    onQueryChange = { query = it },
-                    onGo = { filtered.firstOrNull()?.let { open(it) } },
+        Column(Modifier.fillMaxSize()) {
+            SearchBar(
+                query = query,
+                onQueryChange = onQueryChange,
+                onGo = { filtered.firstOrNull()?.let(onOpen) },
+            )
+            Box(Modifier.weight(1f)) {
+                LazyColumn(
+                    state = listState,
+                    contentPadding = PaddingValues(bottom = 48.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(end = 32.dp)
+                        .nestedScroll(pullToClose),
+                ) {
+                    if (rows.isEmpty() && query.isNotBlank()) {
+                        item(key = "empty") {
+                            Text(
+                                "Không có ứng dụng nào tên \"$query\"",
+                                style = textOnWallpaper.copy(fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f)),
+                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+                            )
+                        }
+                    }
+                    items(rows, key = { it.key }) { row ->
+                        when (row) {
+                            is ListRow.Header -> Text(
+                                text = row.letter,
+                                style = textOnWallpaper.copy(
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White.copy(alpha = 0.6f),
+                                ),
+                                modifier = Modifier.padding(start = 24.dp, top = 20.dp, bottom = 4.dp),
+                            )
+                            is ListRow.App -> AppRow(
+                                app = row.app,
+                                isFavorite = row.isFavorite,
+                                large = false,
+                                onOpen = { onOpen(row.app) },
+                                onToggleFavorite = { onToggleFavorite(row.app) },
+                                onInfo = { repo.openAppInfo(row.app) },
+                                onUninstall = { repo.uninstall(row.app) },
+                            )
+                        }
+                    }
+                }
+
+                val scope = rememberCoroutineScope()
+                AlphabetBar(
+                    letters = letterIndex.keys.toList(),
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 4.dp),
+                    onSelect = { letter ->
+                        letterIndex[letter]?.let { idx -> scope.launch { listState.scrollToItem(idx) } }
+                    },
                 )
             }
-            if (rows.isEmpty() && query.isNotBlank()) {
-                item(key = "empty") {
-                    Text(
-                        "Không có ứng dụng nào tên \"$query\"",
-                        style = textOnWallpaper.copy(fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f)),
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
-                    )
-                }
-            }
-            items(rows, key = { it.key }) { row ->
-                when (row) {
-                    is ListRow.Header -> Text(
-                        text = if (row.letter == FAVORITE_MARK) "Yêu thích" else row.letter,
-                        style = textOnWallpaper.copy(
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White.copy(alpha = 0.6f),
-                        ),
-                        modifier = Modifier.padding(start = 24.dp, top = 20.dp, bottom = 4.dp),
-                    )
-                    is ListRow.App -> AppRow(
-                        app = row.app,
-                        isFavorite = row.isFavorite,
-                        onOpen = { open(row.app) },
-                        onToggleFavorite = { toggleFavorite(row.app) },
-                        onInfo = { repo.openAppInfo(row.app) },
-                        onUninstall = { repo.uninstall(row.app) },
-                    )
-                }
-            }
-            item(key = "bottom_space") { Spacer(Modifier.size(48.dp)) }
         }
-
-        AlphabetBar(
-            letters = letterIndex.keys.toList(),
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 4.dp),
-            onSelect = { letter ->
-                letterIndex[letter]?.let { idx ->
-                    scope.launch { listState.scrollToItem(idx + TOP_ITEMS) }
-                }
-            },
-        )
     }
 }
 
-// ---------------------------------------------------------------------------
+/** Một dòng trong danh sách: tiêu đề chữ cái hoặc một ứng dụng. */
+private sealed class ListRow(val key: String) {
+    class Header(val letter: String) : ListRow("h_$letter")
+    class App(val app: AppInfo, val isFavorite: Boolean) : ListRow("a_${app.key}")
+}
+
+// ===========================================================================
 // Đồng hồ lớn + ngày + pin
-// ---------------------------------------------------------------------------
+// ===========================================================================
 @Composable
 private fun ClockHeader(repo: AppRepository) {
     val context = LocalContext.current
     var now by remember { mutableStateOf(LocalDateTime.now()) }
     var battery by remember { mutableIntStateOf(-1) }
 
-    // Cập nhật đúng lúc sang phút mới
     LaunchedEffect(Unit) {
         while (true) {
             now = LocalDateTime.now()
@@ -246,7 +480,6 @@ private fun ClockHeader(repo: AppRepository) {
         }
     }
 
-    // Theo dõi % pin
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
@@ -269,35 +502,33 @@ private fun ClockHeader(repo: AppRepository) {
     val date = now.format(DateTimeFormatter.ofPattern("EEEE, d 'tháng' M", vi))
         .replaceFirstChar { it.titlecase(vi) }
 
-    Column(Modifier.padding(start = 24.dp, top = 56.dp, bottom = 28.dp)) {
+    Column(Modifier.padding(start = 24.dp, top = 40.dp)) {
         Text(
             text = time,
-            style = textOnWallpaper.copy(fontSize = 76.sp, fontWeight = FontWeight.Light, letterSpacing = (-2).sp),
+            style = textOnWallpaper.copy(fontSize = 80.sp, fontWeight = FontWeight.Light, letterSpacing = (-2).sp),
             modifier = Modifier.clickable { repo.openSafely(Intent(AlarmClock.ACTION_SHOW_ALARMS)) },
         )
         Text(
             text = if (battery >= 0) "$date   ·   $battery%" else date,
             style = textOnWallpaper.copy(fontSize = 16.sp, color = Color.White.copy(alpha = 0.85f)),
             modifier = Modifier.clickable {
-                repo.openSafely(
-                    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_CALENDAR)
-                )
+                repo.openSafely(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_CALENDAR))
             },
         )
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Ô tìm kiếm ứng dụng
-// ---------------------------------------------------------------------------
+// ===========================================================================
 @Composable
 private fun SearchBar(query: String, onQueryChange: (String) -> Unit, onGo: () -> Unit) {
     Box(
         Modifier
-            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp)
             .fillMaxWidth()
             .clip(RoundedCornerShape(24.dp))
-            .background(Color.White.copy(alpha = 0.16f))
+            .background(Color.White.copy(alpha = 0.14f))
             .padding(horizontal = 20.dp, vertical = 12.dp)
     ) {
         if (query.isEmpty()) {
@@ -316,14 +547,15 @@ private fun SearchBar(query: String, onQueryChange: (String) -> Unit, onGo: () -
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Một dòng ứng dụng: chạm để mở, nhấn giữ để hiện menu
-// ---------------------------------------------------------------------------
+// ===========================================================================
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AppRow(
     app: AppInfo,
     isFavorite: Boolean,
+    large: Boolean,
     onOpen: () -> Unit,
     onToggleFavorite: () -> Unit,
     onInfo: () -> Unit,
@@ -346,13 +578,17 @@ private fun AppRow(
                         menuOpen = true
                     },
                 )
-                .padding(horizontal = 16.dp, vertical = 9.dp),
+                .padding(horizontal = 16.dp, vertical = if (large) 11.dp else 9.dp),
         ) {
-            Image(bitmap = app.icon, contentDescription = null, modifier = Modifier.size(40.dp))
+            Image(
+                bitmap = app.icon,
+                contentDescription = null,
+                modifier = Modifier.size(if (large) 44.dp else 40.dp),
+            )
             Spacer(Modifier.width(16.dp))
             Text(
                 text = app.label,
-                style = textOnWallpaper.copy(fontSize = 18.sp),
+                style = textOnWallpaper.copy(fontSize = if (large) 22.sp else 18.sp),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -374,9 +610,9 @@ private fun AppRow(
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Thanh chữ cái A–Z bên phải: chạm hoặc vuốt để nhảy nhanh
-// ---------------------------------------------------------------------------
+// ===========================================================================
 @Composable
 private fun AlphabetBar(
     letters: List<String>,
@@ -412,7 +648,10 @@ private fun AlphabetBar(
                     onDragStart = { pick(it.y) },
                     onDragEnd = { active = null },
                     onDragCancel = { active = null },
-                ) { change, _ -> pick(change.position.y) }
+                ) { change, _ ->
+                    change.consume()
+                    pick(change.position.y)
+                }
             }
             .pointerInput(Unit) {
                 detectTapGestures { pick(it.y); active = null }

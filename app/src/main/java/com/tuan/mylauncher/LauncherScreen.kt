@@ -21,6 +21,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,6 +32,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -39,6 +41,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -74,7 +78,9 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -96,7 +102,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
-import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -119,13 +124,14 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
     var favoriteKeys by remember { mutableStateOf(repo.favorites()) }
     var drawerOpen by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
-    var pendingLetter by remember { mutableStateOf<String?>(null) }
-    var homeBarDragging by remember { mutableStateOf(false) }
+
+    // Chữ cái đang "xem nhanh" trên màn hình chính (kiểu Niagara) và vị trí ngón tay
+    var peekLetter by remember { mutableStateOf<String?>(null) }
+    var peekY by remember { mutableFloatStateOf(0f) }
 
     val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Tải lại danh sách mỗi khi quay về màn hình chính
     LaunchedEffect(Unit) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             apps = repo.loadApps()
@@ -138,9 +144,13 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
         focusManager.clearFocus()
     }
 
-    // Bấm Home hoặc Back: đóng danh sách, quay về màn hình chính
-    LaunchedEffect(homeSignal) { if (homeSignal > 0) closeDrawer() }
-    BackHandler(enabled = drawerOpen) { closeDrawer() }
+    fun resetHome() {
+        closeDrawer()
+        peekLetter = null
+    }
+
+    LaunchedEffect(homeSignal) { if (homeSignal > 0) resetHome() }
+    BackHandler(enabled = drawerOpen || peekLetter != null) { resetHome() }
 
     val favorites = remember(apps, favoriteKeys) {
         favoriteKeys.mapNotNull { k -> apps.find { it.key == k } }
@@ -148,10 +158,14 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
     val allLetters = remember(apps) {
         apps.map { it.letter }.distinct().sortedWith(letterOrder)
     }
+    val peekApps = remember(apps, peekLetter) {
+        val l = peekLetter
+        if (l == null) emptyList() else apps.filter { it.letter == l }
+    }
 
     fun open(app: AppInfo) {
         repo.launch(app)
-        closeDrawer()
+        resetHome()
     }
 
     fun toggleFavorite(app: AppInfo) {
@@ -168,7 +182,6 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
         repo.saveFavorites(favoriteKeys)
     }
 
-    // Màn hình chính mờ dần khi mở danh sách, để không bị chữ chồng lên nhau
     val homeAlpha by animateFloatAsState(if (drawerOpen) 0f else 1f, label = "homeAlpha")
 
     Box(Modifier.fillMaxSize()) {
@@ -176,9 +189,16 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
             modifier = Modifier.graphicsLayer { alpha = homeAlpha },
             repo = repo,
             favorites = favorites,
+            peekLetter = peekLetter,
+            peekApps = peekApps,
+            peekY = peekY,
+            onDismissPeek = { peekLetter = null },
             onOpen = ::open,
             onToggleFavorite = ::toggleFavorite,
-            onOpenDrawer = { drawerOpen = true },
+            onOpenDrawer = {
+                peekLetter = null
+                drawerOpen = true
+            },
         )
 
         AnimatedVisibility(
@@ -192,18 +212,15 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
                 favoriteKeys = favoriteKeys,
                 query = query,
                 onQueryChange = { query = it },
-                pendingLetter = pendingLetter,
-                onLetterHandled = { pendingLetter = null },
                 onOpen = ::open,
                 onToggleFavorite = ::toggleFavorite,
                 onClose = ::closeDrawer,
-                showAlphabet = !homeBarDragging,
             )
         }
 
-        // Thanh chữ cái của màn hình chính, nằm trên cùng để hiệu ứng sóng
-        // vẫn thấy được khi ngăn danh sách trượt lên trong lúc đang vuốt
-        if (!drawerOpen || homeBarDragging) {
+        // Thanh chữ cái của màn hình chính: vuốt tới chữ nào, các app của chữ đó
+        // hiện ngay bên trái (giống Niagara), không cần mở cả danh sách
+        if (!drawerOpen) {
             Box(
                 Modifier
                     .fillMaxSize()
@@ -212,12 +229,11 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
                 AlphabetBar(
                     letters = allLetters,
                     modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .padding(end = 4.dp),
-                    onDragStateChange = { homeBarDragging = it },
-                    onSelect = { letter ->
-                        pendingLetter = letter
-                        drawerOpen = true
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 6.dp, bottom = 20.dp),
+                    onSelect = { letter, yInRoot ->
+                        peekLetter = letter
+                        peekY = yInRoot
                     },
                 )
             }
@@ -226,7 +242,7 @@ fun LauncherScreen(repo: AppRepository, homeSignal: Int) {
 }
 
 // ===========================================================================
-// Màn hình chính: đồng hồ + vài ứng dụng yêu thích, nhìn thấy hình nền
+// Màn hình chính: đồng hồ + ứng dụng yêu thích trên nền hình nền trong suốt.
 // Vuốt lên: mở danh sách. Vuốt xuống: mở thanh thông báo.
 // ===========================================================================
 @Composable
@@ -234,20 +250,26 @@ private fun HomeScreen(
     modifier: Modifier = Modifier,
     repo: AppRepository,
     favorites: List<AppInfo>,
+    peekLetter: String?,
+    peekApps: List<AppInfo>,
+    peekY: Float,
+    onDismissPeek: () -> Unit,
     onOpen: (AppInfo) -> Unit,
     onToggleFavorite: (AppInfo) -> Unit,
     onOpenDrawer: () -> Unit,
 ) {
     val threshold = with(LocalDensity.current) { 56.dp.toPx() }
     val openDrawer by rememberUpdatedState(onOpenDrawer)
+    val dismissPeek by rememberUpdatedState(onDismissPeek)
     var dragTotal by remember { mutableFloatStateOf(0f) }
+    val favoritesAlpha by animateFloatAsState(if (peekLetter == null) 1f else 0f, label = "favAlpha")
 
     Box(
         modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0x40000000), Color.Transparent, Color(0x40000000))
+                    listOf(Color(0x33000000), Color.Transparent, Color(0x33000000))
                 )
             )
             .pointerInput(Unit) {
@@ -266,26 +288,29 @@ private fun HomeScreen(
                     dragTotal += amount
                 }
             }
-            .systemBarsPadding()
+            // Chạm vào chỗ trống: tắt danh sách xem nhanh
+            .pointerInput(Unit) { detectTapGestures { dismissPeek() } }
     ) {
         Column(
             Modifier
                 .fillMaxSize()
-                .padding(end = 32.dp)
+                .systemBarsPadding()
+                .padding(end = 48.dp)
         ) {
             ClockHeader(repo)
 
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .graphicsLayer { alpha = favoritesAlpha },
                 contentAlignment = Alignment.CenterStart,
             ) {
                 if (favorites.isEmpty()) {
                     Column(Modifier.padding(horizontal = 24.dp)) {
                         Text(
-                            "Vuốt lên để xem tất cả ứng dụng",
-                            style = textOnWallpaper.copy(fontSize = 18.sp),
+                            "Vuốt dọc theo bảng chữ cái bên phải để tìm ứng dụng",
+                            style = textOnWallpaper.copy(fontSize = 17.sp),
                         )
                         Spacer(Modifier.height(8.dp))
                         Text(
@@ -311,6 +336,72 @@ private fun HomeScreen(
             }
             Spacer(Modifier.height(32.dp))
         }
+
+        // Danh sách xem nhanh: các app của chữ cái đang chọn, đặt ngang tầm ngón tay
+        if (peekLetter != null && peekApps.isNotEmpty()) {
+            PeekPanel(
+                letter = peekLetter,
+                apps = peekApps,
+                anchorY = peekY,
+                repo = repo,
+                onOpen = onOpen,
+                onToggleFavorite = onToggleFavorite,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PeekPanel(
+    letter: String,
+    apps: List<AppInfo>,
+    anchorY: Float,
+    repo: AppRepository,
+    onOpen: (AppInfo) -> Unit,
+    onToggleFavorite: (AppInfo) -> Unit,
+) {
+    val density = LocalDensity.current
+    var containerHeight by remember { mutableIntStateOf(0) }
+    var panelHeight by remember { mutableIntStateOf(0) }
+    val topLimit = with(density) { 180.dp.toPx() }      // không đè lên đồng hồ
+    val bottomLimit = with(density) { 56.dp.toPx() }    // chừa thanh điều hướng
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .onSizeChanged { containerHeight = it.height }
+    ) {
+        val maxPanel = with(density) { (containerHeight - topLimit - bottomLimit).coerceAtLeast(0f).toDp() }
+        Column(
+            Modifier
+                .padding(end = 64.dp)
+                .fillMaxWidth()
+                .heightIn(max = maxPanel)
+                .onSizeChanged { panelHeight = it.height }
+                .graphicsLayer {
+                    val wanted = anchorY - panelHeight / 2f
+                    val maxTop = (containerHeight - bottomLimit - panelHeight).coerceAtLeast(topLimit)
+                    translationY = wanted.coerceIn(topLimit, maxTop)
+                }
+                .verticalScroll(rememberScrollState())
+        ) {
+            Text(
+                text = letter,
+                style = textOnWallpaper.copy(fontSize = 20.sp, fontWeight = FontWeight.SemiBold),
+                modifier = Modifier.padding(start = 24.dp, bottom = 4.dp),
+            )
+            apps.forEach { app ->
+                AppRow(
+                    app = app,
+                    isFavorite = false,
+                    large = false,
+                    onOpen = { onOpen(app) },
+                    onToggleFavorite = { onToggleFavorite(app) },
+                    onInfo = { repo.openAppInfo(app) },
+                    onUninstall = { repo.uninstall(app) },
+                )
+            }
+        }
     }
 }
 
@@ -325,12 +416,9 @@ private fun AppDrawer(
     favoriteKeys: List<String>,
     query: String,
     onQueryChange: (String) -> Unit,
-    pendingLetter: String?,
-    onLetterHandled: () -> Unit,
     onOpen: (AppInfo) -> Unit,
     onToggleFavorite: (AppInfo) -> Unit,
     onClose: () -> Unit,
-    showAlphabet: Boolean,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -357,13 +445,6 @@ private fun AppDrawer(
         rows.withIndex()
             .filter { it.value is ListRow.Header }
             .associate { (it.value as ListRow.Header).letter to it.index }
-    }
-
-    // Mở từ thanh chữ cái ở màn hình chính: nhảy tới chữ đó
-    LaunchedEffect(pendingLetter, letterIndex) {
-        val letter = pendingLetter ?: return@LaunchedEffect
-        letterIndex[letter]?.let { listState.scrollToItem(it) }
-        onLetterHandled()
     }
 
     // Kéo xuống ở đầu danh sách để đóng
@@ -412,7 +493,7 @@ private fun AppDrawer(
         Modifier
             .fillMaxSize()
             .graphicsLayer { translationY = pull * 0.5f }
-            .background(Color.Black.copy(alpha = 0.72f))
+            .background(Color.Black.copy(alpha = 0.45f))
             // Chặn chạm xuyên xuống màn hình chính phía dưới
             .pointerInput(Unit) {
                 awaitPointerEventScope { while (true) awaitPointerEvent() }
@@ -436,7 +517,7 @@ private fun AppDrawer(
                     contentPadding = PaddingValues(bottom = 48.dp),
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(end = 32.dp)
+                        .padding(end = 48.dp)
                         .nestedScroll(pullToClose),
                 ) {
                     if (rows.isEmpty() && query.isNotBlank()) {
@@ -474,17 +555,15 @@ private fun AppDrawer(
             }
         }
 
-        if (showAlphabet) {
-            AlphabetBar(
-                letters = letterIndex.keys.toList(),
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 4.dp),
-                onSelect = { letter ->
-                    letterIndex[letter]?.let { idx -> scope.launch { listState.scrollToItem(idx) } }
-                },
-            )
-        }
+        AlphabetBar(
+            letters = letterIndex.keys.toList(),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 6.dp, bottom = 20.dp),
+            onSelect = { letter, _ ->
+                letterIndex[letter]?.let { idx -> scope.launch { listState.scrollToItem(idx) } }
+            },
+        )
     }
 }
 
@@ -527,20 +606,23 @@ private fun ClockHeader(repo: AppRepository) {
         onDispose { context.unregisterReceiver(receiver) }
     }
 
-    val vi = remember { Locale("vi") }
+    // Kiểu Niagara: "20:42" và "T.4, 30 Th9"
     val time = now.format(DateTimeFormatter.ofPattern("HH:mm"))
-    val date = now.format(DateTimeFormatter.ofPattern("EEEE, d 'tháng' M", vi))
-        .replaceFirstChar { it.titlecase(vi) }
+    val weekday = when (now.dayOfWeek.value) {
+        7 -> "CN"
+        else -> "T.${now.dayOfWeek.value + 1}"
+    }
+    val date = "$weekday, ${now.dayOfMonth} Th${now.monthValue}"
 
-    Column(Modifier.padding(start = 24.dp, top = 40.dp)) {
+    Column(Modifier.padding(start = 28.dp, top = 64.dp)) {
         Text(
             text = time,
-            style = textOnWallpaper.copy(fontSize = 80.sp, fontWeight = FontWeight.Light, letterSpacing = (-2).sp),
+            style = textOnWallpaper.copy(fontSize = 52.sp, fontWeight = FontWeight.Normal),
             modifier = Modifier.clickable { repo.openSafely(Intent(AlarmClock.ACTION_SHOW_ALARMS)) },
         )
         Text(
             text = if (battery >= 0) "$date   ·   $battery%" else date,
-            style = textOnWallpaper.copy(fontSize = 16.sp, color = Color.White.copy(alpha = 0.85f)),
+            style = textOnWallpaper.copy(fontSize = 15.sp, color = Color.White.copy(alpha = 0.9f)),
             modifier = Modifier.clickable {
                 repo.openSafely(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_CALENDAR))
             },
@@ -649,7 +731,7 @@ private fun AlphabetBar(
     letters: List<String>,
     modifier: Modifier = Modifier,
     onDragStateChange: (Boolean) -> Unit = {},
-    onSelect: (String) -> Unit,
+    onSelect: (letter: String, yInRoot: Float) -> Unit,
 ) {
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
@@ -661,6 +743,7 @@ private fun AlphabetBar(
     var touchY by remember { mutableFloatStateOf(0f) }
     var active by remember { mutableStateOf<String?>(null) }
     val centers = remember(letters) { FloatArray(letters.size) }
+    var barTop by remember { mutableFloatStateOf(0f) }
 
     // Độ mạnh của sóng: 0 = phẳng, 1 = phình hết cỡ
     val strength by animateFloatAsState(
@@ -669,11 +752,11 @@ private fun AlphabetBar(
         label = "wave",
     )
 
-    val waveRadius = with(density) { 100.dp.toPx() }   // bán kính vùng phình
-    val maxShift = with(density) { 46.dp.toPx() }      // chữ cong ra trái tối đa
-    val bubbleRadius = with(density) { 34.dp.toPx() }
-    val bubbleOffset = with(density) { 104.dp.toPx() } // khoảng cách bong bóng tới thanh
-    val bubbleText = remember { TextStyle(fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color(0xFF15181C)) }
+    val waveRadius = with(density) { 150.dp.toPx() }   // bán kính vùng cong
+    val maxShift = with(density) { 64.dp.toPx() }      // chữ cong ra trái tối đa
+    val bubbleRadius = with(density) { 28.dp.toPx() }
+    val bubbleOffset = with(density) { 96.dp.toPx() }  // khoảng cách bong bóng tới thanh
+    val bubbleText = remember { TextStyle(fontSize = 26.sp, fontWeight = FontWeight.Medium, color = Color.White) }
 
     fun waveAt(index: Int): Float {
         val c = centers.getOrElse(index) { return 0f }
@@ -695,7 +778,7 @@ private fun AlphabetBar(
         if (letter != active) {
             active = letter
             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            currentOnSelect(letter)
+            currentOnSelect(letter, barTop + centers.getOrElse(best) { y })
         }
     }
 
@@ -703,7 +786,8 @@ private fun AlphabetBar(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = modifier
-            .width(28.dp)
+            .width(32.dp)
+            .onGloballyPositioned { barTop = it.positionInRoot().y }
             .pointerInput(letters) {
                 awaitEachGesture {
                     val down = awaitFirstDown()
@@ -732,7 +816,7 @@ private fun AlphabetBar(
                 if (strength < 0.01f) return@drawWithContent
                 val center = Offset(size.width / 2f - bubbleOffset, touchY)
                 drawCircle(
-                    color = Color.White.copy(alpha = 0.95f * strength),
+                    color = Color(0xFF2B2E33).copy(alpha = 0.85f * strength),
                     radius = bubbleRadius * (0.5f + 0.5f * strength),
                     center = center,
                 )
@@ -752,9 +836,9 @@ private fun AlphabetBar(
             Text(
                 text = letter,
                 style = textOnWallpaper.copy(
-                    fontSize = 11.sp,
-                    fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.75f),
+                    fontSize = 14.sp,
+                    fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.9f),
                 ),
                 modifier = Modifier
                     .onGloballyPositioned {
@@ -765,10 +849,10 @@ private fun AlphabetBar(
                     .graphicsLayer {
                         val w = waveAt(index)
                         translationX = -w * maxShift
-                        scaleX = 1f + w * 0.9f
-                        scaleY = 1f + w * 0.9f
+                        scaleX = 1f + w * 0.35f
+                        scaleY = 1f + w * 0.35f
                     }
-                    .padding(vertical = 1.5.dp),
+                    .padding(vertical = 1.dp),
             )
         }
     }

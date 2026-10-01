@@ -1,0 +1,9 @@
+<resources>
+    <!-- Hiện hình nền điện thoại phía sau giao diện -->
+    <style name="Theme.MyLauncher" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowShowWallpaper">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
